@@ -110,10 +110,6 @@
         });
         return false;
         };
-
-      $("#google-signin").click(function() {
-        $(".g-signin2:first-child > div").click();
-      });
     </script>
   [% END %]
 

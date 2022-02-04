@@ -255,7 +255,8 @@ sub oauth_redirect :Path('/oauth-redirect') Args(0) {
         value => $after,
     };
 
-    $c->res->redirect($c->config->{oauth_url} . "?client_id=$client_id&scope=user:email");
+    # TODO: state for XSRF prevention
+    $c->res->redirect($c->config->{oauth_url} . "?client_id=$client_id&response_type=code&scope=email&response_mode=query");
 }
 
 
