@@ -137,6 +137,29 @@ sub doEmailLogin {
 }
 
 
+sub oauth_login :Path('/oauth-login') Args(0) {
+    my ($self, $c) = @_;
+    requirePost($c);
+
+    error($c, "Logging in via OAuth is not enabled.") unless $c->config->{enable_oauth_login};
+
+    my $ua = LWP::UserAgent->new();
+    my $response = $ua->post(
+        $c->config->{oauth_url}, #'https://www.googleapis.com/oauth2/v3/tokeninfo',
+        { id_token => ($c->stash->{params}->{id_token} // die "No token."),
+        });
+    error($c, "Did not get a response from IdP.") unless $response->is_success;
+
+    my $data = decode_json($response->decoded_content) or die;
+    echo $data;
+
+    die unless $data->{aud} eq $c->config->{google_client_id};
+    die "Email address is not verified" unless $data->{email_verified};
+    # FIXME: verify hosted domain claim?
+
+    doEmailLogin($self, $c, "google", $data->{email}, $data->{name} // undef);
+}
+
 sub google_login :Path('/google-login') Args(0) {
     my ($self, $c) = @_;
     requirePost($c);
@@ -218,6 +241,21 @@ sub github_redirect :Path('/github-redirect') Args(0) {
     };
 
     $c->res->redirect("https://github.com/login/oauth/authorize?client_id=$client_id&scope=user:email");
+}
+
+sub oauth_redirect :Path('/oauth-redirect') Args(0) {
+    my ($self, $c) = @_;
+
+    my $client_id = $c->config->{oauth_client_id} or die "oauth_client_id not configured.";
+
+    my $after = "/" . $c->req->params->{after};
+
+    $c->res->cookies->{'after_oauth'} = {
+        name => 'after_oauth',
+        value => $after,
+    };
+
+    $c->res->redirect($c->config->{oauth_url} . "?client_id=$client_id&scope=user:email");
 }
 
 
