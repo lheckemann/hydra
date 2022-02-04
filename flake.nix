@@ -567,7 +567,8 @@
 
           enableParallelBuilding = true;
 
-          #doCheck = true;
+          doCheck = false;
+          doInstallCheck = false;
 
           preCheck = ''
             patchShebangs .
