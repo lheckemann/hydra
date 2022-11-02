@@ -6,13 +6,15 @@
 
   outputs = { self, nixpkgs, nix }:
     let
-
       version = "${builtins.readFile ./version.txt}.${builtins.substring 0 8 (self.lastModifiedDate or "19700101")}.${self.shortRev or "DIRTY"}";
 
-      pkgs = import nixpkgs {
-        system = "x86_64-linux";
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      forEachSystem = nixpkgs.lib.genAttrs systems;
+
+      pkgs = forEachSystem (system: import nixpkgs {
+        inherit system;
         overlays = [ self.overlays.default nix.overlays.default ];
-      };
+      });
 
       # NixOS configuration used for VM tests.
       hydraServer =
@@ -254,20 +256,20 @@
 
       hydraJobs = {
 
-        build.x86_64-linux = packages.x86_64-linux.hydra;
+        build = forEachSystem (system: packages.${system}.hydra);
 
-        manual =
-          pkgs.runCommand "hydra-manual-${version}" { }
+        manual = forEachSystem (system:
+          pkgs.${system}.runCommand "hydra-manual-${version}" { }
             ''
               mkdir -p $out/share
-              cp -prvd ${pkgs.hydra}/share/doc $out/share/
+              cp -prvd ${pkgs.${system}.hydra}/share/doc $out/share/
 
               mkdir $out/nix-support
               echo "doc manual $out/share/doc/hydra" >> $out/nix-support/hydra-build-products
-            '';
+            '');
 
-        tests.install.x86_64-linux =
-          with import (nixpkgs + "/nixos/lib/testing-python.nix") { system = "x86_64-linux"; };
+        tests.install = forEachSystem (system:
+          with import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; };
           simpleTest {
             nodes.machine = hydraServer;
             testScript =
@@ -279,10 +281,10 @@
                 machine.wait_for_open_port("3000")
                 machine.succeed("curl --fail http://localhost:3000/")
               '';
-          };
+          });
 
-        tests.notifications.x86_64-linux =
-          with import (nixpkgs + "/nixos/lib/testing-python.nix") { system = "x86_64-linux"; };
+        tests.notifications = forEachSystem (system:
+          with import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; };
           simpleTest {
             nodes.machine = { pkgs, ... }: {
               imports = [ hydraServer ];
@@ -336,10 +338,10 @@
                   + "--data-urlencode 'q=SELECT * FROM hydra_build_status' | grep success"
               )
             '';
-          };
+          });
 
-        tests.gitea.x86_64-linux =
-          with import (nixpkgs + "/nixos/lib/testing-python.nix") { system = "x86_64-linux"; };
+        tests.gitea = forEachSystem (system:
+          with import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; };
           makeTest {
             nodes.machine = { pkgs, ... }: {
               imports = [ hydraServer ];
@@ -352,7 +354,7 @@
                 distributedBuilds = true;
                 buildMachines = [{
                   hostName = "localhost";
-                  systems = [ "x86_64-linux" ];
+                  systems = [ system ];
                 }];
                 binaryCaches = [ ];
               };
@@ -467,7 +469,7 @@
                 smallDrv = pkgs.writeText "jobset.nix" ''
                   { trivial = builtins.derivation {
                       name = "trivial";
-                      system = "x86_64-linux";
+                      system = "${system}";
                       builder = "/bin/sh";
                       allowSubstitutes = false;
                       preferLocalBuild = true;
@@ -531,24 +533,28 @@
 
                 machine.shutdown()
               '';
-          };
+          });
 
-        tests.validate-openapi = pkgs.runCommand "validate-openapi"
+        tests.validate-openapi = forEachSystem (system: pkgs.${system}.runCommand "validate-openapi"
           { buildInputs = [ pkgs.openapi-generator-cli ]; }
           ''
             openapi-generator-cli validate -i ${./hydra-api.yaml}
             touch $out
-          '';
+          '');
 
         container = nixosConfigurations.container.config.system.build.toplevel;
       };
 
-      checks.x86_64-linux.build = hydraJobs.build.x86_64-linux;
-      checks.x86_64-linux.install = hydraJobs.tests.install.x86_64-linux;
-      checks.x86_64-linux.validate-openapi = hydraJobs.tests.validate-openapi;
+      checks = forEachSystem (system: {
+        build = hydraJobs.build.${system};
+        install = hydraJobs.tests.install.${system};
+        validate-openapi = hydraJobs.tests.validate-openapi.${system};
+      });
 
-      packages.x86_64-linux.hydra = pkgs.hydra;
-      packages.x86_64-linux.default = pkgs.hydra;
+      packages = forEachSystem (system: {
+        hydra = pkgs.${system}.hydra;
+        default = pkgs.${system}.hydra;
+      });
 
       nixosModules.hydra = {
         imports = [ ./hydra-module.nix ];
