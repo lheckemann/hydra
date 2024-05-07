@@ -1,6 +1,7 @@
 #include "state.hh"
 #include "hydra-build-result.hh"
 #include "globals.hh"
+#include "thread-pool.hh"
 
 #include <cstring>
 
@@ -10,8 +11,14 @@ using namespace nix;
 void State::queueMonitor()
 {
     while (true) {
+        auto conn(dbPool.get());
         try {
-            queueMonitorLoop();
+            queueMonitorLoop(*conn);
+        } catch (pqxx::broken_connection & e) {
+            printMsg(lvlError, "queue monitor: %s", e.what());
+            printMsg(lvlError, "queue monitor: Reconnecting in 10s");
+            conn.markBad();
+            sleep(10);
         } catch (std::exception & e) {
             printError("queue monitor: %s", e.what());
             sleep(10); // probably a DB problem, so don't retry right away
@@ -20,53 +27,58 @@ void State::queueMonitor()
 }
 
 
-void State::queueMonitorLoop()
+void State::queueMonitorLoop(Connection & conn)
 {
-    auto conn(dbPool.get());
-
-    receiver buildsAdded(*conn, "builds_added");
-    receiver buildsRestarted(*conn, "builds_restarted");
-    receiver buildsCancelled(*conn, "builds_cancelled");
-    receiver buildsDeleted(*conn, "builds_deleted");
-    receiver buildsBumped(*conn, "builds_bumped");
-    receiver jobsetSharesChanged(*conn, "jobset_shares_changed");
+    receiver buildsAdded(conn, "builds_added");
+    receiver buildsRestarted(conn, "builds_restarted");
+    receiver buildsCancelled(conn, "builds_cancelled");
+    receiver buildsDeleted(conn, "builds_deleted");
+    receiver buildsBumped(conn, "builds_bumped");
+    receiver jobsetSharesChanged(conn, "jobset_shares_changed");
 
     auto destStore = getDestStore();
 
-    unsigned int lastBuildId = 0;
-
     bool quit = false;
     while (!quit) {
+        auto t_before_work = std::chrono::steady_clock::now();
+
         localStore->clearPathInfoCache();
 
-        bool done = getQueuedBuilds(*conn, destStore, lastBuildId);
+        bool done = getQueuedBuilds(conn, destStore);
 
         if (buildOne && buildOneDone) quit = true;
+
+        auto t_after_work = std::chrono::steady_clock::now();
+
+        prom.queue_monitor_time_spent_running.Increment(
+            std::chrono::duration_cast<std::chrono::microseconds>(t_after_work - t_before_work).count());
 
         /* Sleep until we get notification from the database about an
            event. */
         if (done && !quit) {
-            conn->await_notification();
+            conn.await_notification();
             nrQueueWakeups++;
         } else
-            conn->get_notifs();
+            conn.get_notifs();
 
         if (auto lowestId = buildsAdded.get()) {
-            lastBuildId = std::min(lastBuildId, static_cast<unsigned>(std::stoul(*lowestId) - 1));
             printMsg(lvlTalkative, "got notification: new builds added to the queue");
         }
         if (buildsRestarted.get()) {
             printMsg(lvlTalkative, "got notification: builds restarted");
-            lastBuildId = 0; // check all builds
         }
         if (buildsCancelled.get() || buildsDeleted.get() || buildsBumped.get()) {
             printMsg(lvlTalkative, "got notification: builds cancelled or bumped");
-            processQueueChange(*conn);
+            processQueueChange(conn);
         }
         if (jobsetSharesChanged.get()) {
             printMsg(lvlTalkative, "got notification: jobset shares changed");
-            processJobsetSharesChange(*conn);
+            processJobsetSharesChange(conn);
         }
+
+        auto t_after_sleep = std::chrono::steady_clock::now();
+        prom.queue_monitor_time_spent_waiting.Increment(
+            std::chrono::duration_cast<std::chrono::microseconds>(t_after_sleep - t_after_work).count());
     }
 
     exit(0);
@@ -80,19 +92,17 @@ struct PreviousFailure : public std::exception {
 
 
 bool State::getQueuedBuilds(Connection & conn,
-    ref<Store> destStore, unsigned int & lastBuildId)
+    ref<Store> destStore)
 {
     prom.queue_checks_started.Increment();
 
-    printInfo("checking the queue for builds > %d...", lastBuildId);
+    printInfo("checking the queue for builds...");
 
     /* Grab the queued builds from the database, but don't process
        them yet (since we don't want a long-running transaction). */
     std::vector<BuildID> newIDs;
-    std::map<BuildID, Build::ptr> newBuildsByID;
+    std::unordered_map<BuildID, Build::ptr> newBuildsByID;
     std::multimap<StorePath, BuildID> newBuildsByPath;
-
-    unsigned int newLastBuildId = lastBuildId;
 
     {
         pqxx::work txn(conn);
@@ -102,17 +112,12 @@ bool State::getQueuedBuilds(Connection & conn,
              "jobsets.name as jobset, job, drvPath, maxsilent, timeout, timestamp, "
              "globalPriority, priority from Builds "
              "inner join jobsets on builds.jobset_id = jobsets.id "
-             "where builds.id > $1 and finished = 0 order by globalPriority desc, builds.id",
-            lastBuildId);
+             "where finished = 0 order by globalPriority desc, random()");
 
         for (auto const & row : res) {
             auto builds_(builds.lock());
             BuildID id = row["id"].as<BuildID>();
             if (buildOne && id != buildOne) continue;
-            if (id > newLastBuildId) {
-                newLastBuildId = id;
-                prom.queue_max_id.Set(id);
-            }
             if (builds_->count(id)) continue;
 
             auto build = std::make_shared<Build>(
@@ -192,15 +197,19 @@ bool State::getQueuedBuilds(Connection & conn,
                 if (!res[0].is_null()) propagatedFrom = res[0].as<BuildID>();
 
                 if (!propagatedFrom) {
-                    for (auto & i : ex.step->drv->outputsAndOptPaths(*localStore)) {
-                        if (i.second.second) {
-                            auto res = txn.exec_params
-                                ("select max(s.build) from BuildSteps s join BuildStepOutputs o on s.build = o.build where path = $1 and startTime != 0 and stopTime != 0 and status = 1",
-                                 localStore->printStorePath(*i.second.second));
-                            if (!res[0][0].is_null()) {
-                                propagatedFrom = res[0][0].as<BuildID>();
-                                break;
-                            }
+                    for (auto & [outputName, optOutputPath] : destStore->queryPartialDerivationOutputMap(ex.step->drvPath, &*localStore)) {
+                        constexpr std::string_view common = "select max(s.build) from BuildSteps s join BuildStepOutputs o on s.build = o.build where startTime != 0 and stopTime != 0 and status = 1";
+                        auto res = optOutputPath
+                            ? txn.exec_params(
+                                std::string { common } + " and path = $1",
+                                localStore->printStorePath(*optOutputPath))
+                            : txn.exec_params(
+                                std::string { common } + " and drvPath = $1 and name = $2",
+                                localStore->printStorePath(ex.step->drvPath),
+                                outputName);
+                        if (!res[0][0].is_null()) {
+                            propagatedFrom = res[0][0].as<BuildID>();
+                            break;
                         }
                     }
                 }
@@ -236,12 +245,10 @@ bool State::getQueuedBuilds(Connection & conn,
         /* If we didn't get a step, it means the step's outputs are
            all valid. So we mark this as a finished, cached build. */
         if (!step) {
-            auto drv = localStore->readDerivation(build->drvPath);
-            BuildOutput res = getBuildOutputCached(conn, destStore, drv);
+            BuildOutput res = getBuildOutputCached(conn, destStore, build->drvPath);
 
-            for (auto & i : drv.outputsAndOptPaths(*localStore))
-                if (i.second.second)
-                    addRoot(*i.second.second);
+            for (auto & i : destStore->queryDerivationOutputMap(build->drvPath, &*localStore))
+                addRoot(i.second);
 
             {
             auto mc = startDbUpdate();
@@ -312,15 +319,13 @@ bool State::getQueuedBuilds(Connection & conn,
 
         /* Stop after a certain time to allow priority bumps to be
            processed. */
-        if (std::chrono::system_clock::now() > start + std::chrono::seconds(600)) {
+        if (std::chrono::system_clock::now() > start + std::chrono::seconds(60)) {
             prom.queue_checks_early_exits.Increment();
             break;
         }
     }
 
     prom.queue_checks_finished.Increment();
-
-    lastBuildId = newBuildsByID.empty() ? newLastBuildId : newBuildsByID.begin()->first - 1;
     return newBuildsByID.empty();
 }
 
@@ -399,6 +404,34 @@ void State::processQueueChange(Connection & conn)
 }
 
 
+std::map<DrvOutput, std::optional<StorePath>> State::getMissingRemotePaths(
+    ref<Store> destStore,
+    const std::map<DrvOutput, std::optional<StorePath>> & paths)
+{
+    Sync<std::map<DrvOutput, std::optional<StorePath>>> missing_;
+    ThreadPool tp;
+
+    for (auto & [output, maybeOutputPath] : paths) {
+        if (!maybeOutputPath) {
+            auto missing(missing_.lock());
+            missing->insert({output, maybeOutputPath});
+        } else {
+            tp.enqueue([&] {
+                if (!destStore->isValidPath(*maybeOutputPath)) {
+                    auto missing(missing_.lock());
+                    missing->insert({output, maybeOutputPath});
+                }
+            });
+        }
+    }
+
+    tp.process();
+
+    auto missing(missing_.lock());
+    return *missing;
+}
+
+
 Step::ptr State::createStep(ref<Store> destStore,
     Connection & conn, Build::ptr build, const StorePath & drvPath,
     Build::ptr referringBuild, Step::ptr referringStep, std::set<StorePath> & finishedDrvs,
@@ -464,10 +497,7 @@ Step::ptr State::createStep(ref<Store> destStore,
 
     step->systemType = step->drv->platform;
     {
-        auto i = step->drv->env.find("requiredSystemFeatures");
-        StringSet features;
-        if (i != step->drv->env.end())
-            features = step->requiredSystemFeatures = tokenizeString<std::set<std::string>>(i->second);
+        StringSet features = step->requiredSystemFeatures = step->parsedDrv->getRequiredSystemFeatures();
         if (step->preferLocalBuild)
             features.insert("local");
         if (!features.empty()) {
@@ -481,26 +511,40 @@ Step::ptr State::createStep(ref<Store> destStore,
         throw PreviousFailure{step};
 
     /* Are all outputs valid? */
-    bool valid = true;
-    DerivationOutputs missing;
-    for (auto & i : step->drv->outputs)
-        if (!destStore->isValidPath(*i.second.path(*localStore, step->drv->name, i.first))) {
-            valid = false;
-            missing.insert_or_assign(i.first, i.second);
-        }
+    auto outputHashes = staticOutputHashes(*localStore, *(step->drv));
+    std::map<DrvOutput, std::optional<StorePath>> paths;
+    for (auto & [outputName, maybeOutputPath] : destStore->queryPartialDerivationOutputMap(drvPath, &*localStore)) {
+        auto outputHash = outputHashes.at(outputName);
+        paths.insert({{outputHash, outputName}, maybeOutputPath});
+    }
+
+    auto missing = getMissingRemotePaths(destStore, paths);
+    bool valid = missing.empty();
 
     /* Try to copy the missing paths from the local store or from
        substitutes. */
     if (!missing.empty()) {
 
         size_t avail = 0;
-        for (auto & i : missing) {
-            auto path = i.second.path(*localStore, step->drv->name, i.first);
-            if (/* localStore != destStore && */ localStore->isValidPath(*path))
+        for (auto & [i, pathOpt] : missing) {
+            // If we don't know the output path from the destination
+            // store, see if the local store can tell us.
+            if (/* localStore != destStore && */ !pathOpt && experimentalFeatureSettings.isEnabled(Xp::CaDerivations))
+                if (auto maybeRealisation = localStore->queryRealisation(i))
+                    pathOpt = maybeRealisation->outPath;
+
+            if (!pathOpt) {
+                // No hope of getting the store object if we don't know
+                // the path.
+                continue;
+            }
+            auto & path = *pathOpt;
+
+            if (/* localStore != destStore && */ localStore->isValidPath(path))
                 avail++;
             else if (useSubstitutes) {
                 SubstitutablePathInfos infos;
-                localStore->querySubstitutablePathInfos({{*path, {}}}, infos);
+                localStore->querySubstitutablePathInfos({{path, {}}}, infos);
                 if (infos.size() == 1)
                     avail++;
             }
@@ -508,26 +552,29 @@ Step::ptr State::createStep(ref<Store> destStore,
 
         if (missing.size() == avail) {
             valid = true;
-            for (auto & i : missing) {
-                auto path = i.second.path(*localStore, step->drv->name, i.first);
+            for (auto & [i, pathOpt] : missing) {
+                // If we found everything, then we should know the path
+                // to every missing store object now.
+                assert(pathOpt);
+                auto & path = *pathOpt;
 
                 try {
                     time_t startTime = time(0);
 
-                    if (localStore->isValidPath(*path))
+                    if (localStore->isValidPath(path))
                         printInfo("copying output ‘%1%’ of ‘%2%’ from local store",
-                            localStore->printStorePath(*path),
+                            localStore->printStorePath(path),
                             localStore->printStorePath(drvPath));
                     else {
                         printInfo("substituting output ‘%1%’ of ‘%2%’",
-                            localStore->printStorePath(*path),
+                            localStore->printStorePath(path),
                             localStore->printStorePath(drvPath));
-                        localStore->ensurePath(*path);
+                        localStore->ensurePath(path);
                         // FIXME: should copy directly from substituter to destStore.
                     }
 
                     copyClosure(*localStore, *destStore,
-                        StorePathSet { *path },
+                        StorePathSet { path },
                         NoRepair, CheckSigs, NoSubstitute);
 
                     time_t stopTime = time(0);
@@ -535,13 +582,13 @@ Step::ptr State::createStep(ref<Store> destStore,
                     {
                         auto mc = startDbUpdate();
                         pqxx::work txn(conn);
-                        createSubstitutionStep(txn, startTime, stopTime, build, drvPath, "out", *path);
+                        createSubstitutionStep(txn, startTime, stopTime, build, drvPath, *(step->drv), "out", path);
                         txn.commit();
                     }
 
                 } catch (Error & e) {
                     printError("while copying/substituting output ‘%s’ of ‘%s’: %s",
-                        localStore->printStorePath(*path),
+                        localStore->printStorePath(path),
                         localStore->printStorePath(drvPath),
                         e.what());
                     valid = false;
@@ -640,17 +687,19 @@ void State::processJobsetSharesChange(Connection & conn)
 }
 
 
-BuildOutput State::getBuildOutputCached(Connection & conn, nix::ref<nix::Store> destStore, const nix::Derivation & drv)
+BuildOutput State::getBuildOutputCached(Connection & conn, nix::ref<nix::Store> destStore, const nix::StorePath & drvPath)
 {
+    auto derivationOutputs = destStore->queryDerivationOutputMap(drvPath, &*localStore);
+
     {
     pqxx::work txn(conn);
 
-    for (auto & [name, output] : drv.outputsAndOptPaths(*localStore)) {
+    for (auto & [name, output] : derivationOutputs) {
         auto r = txn.exec_params
             ("select id, buildStatus, releaseName, closureSize, size from Builds b "
              "join BuildOutputs o on b.id = o.build "
              "where finished = 1 and (buildStatus = 0 or buildStatus = 6) and path = $1",
-             localStore->printStorePath(*output.second));
+             localStore->printStorePath(output));
         if (r.empty()) continue;
         BuildID id = r[0][0].as<BuildID>();
 
@@ -704,5 +753,5 @@ BuildOutput State::getBuildOutputCached(Connection & conn, nix::ref<nix::Store> 
     }
 
     NarMemberDatas narMembers;
-    return getBuildOutput(destStore, narMembers, drv);
+    return getBuildOutput(destStore, narMembers, derivationOutputs);
 }

@@ -15,6 +15,7 @@ use Nix::Config;
 use List::SomeUtils qw(all);
 use Encode;
 use JSON::PP;
+use WWW::Form::UrlEncoded::PP qw();
 
 use feature 'state';
 
@@ -78,14 +79,16 @@ sub build_GET {
 
     $c->stash->{template} = 'build.tt';
     $c->stash->{isLocalStore} = isLocalStore();
+    # XXX: If the derivation is content-addressed then this will always return
+    # false because `$_->path` will be empty
     $c->stash->{available} =
         $c->stash->{isLocalStore}
-        ? all { isValidPath($_->path) } $build->buildoutputs->all
+        ? all { $_->path && isValidPath($_->path) } $build->buildoutputs->all
         : 1;
     $c->stash->{drvAvailable} = isValidPath $build->drvpath;
 
     if ($build->finished && $build->iscachedbuild) {
-        my $path = ($build->buildoutputs)[0]->path or die;
+        my $path = ($build->buildoutputs)[0]->path or undef;
         my $cachedBuildStep = findBuildStepByOutPath($self, $c, $path);
         if (defined $cachedBuildStep) {
             $c->stash->{cachedBuild} = $cachedBuildStep->build;
@@ -139,7 +142,7 @@ sub view_nixlog : Chained('buildChain') PathPart('nixlog') {
     $c->stash->{step} = $step;
 
     my $drvPath = $step->drvpath;
-    my $log_uri = $c->uri_for($c->controller('Root')->action_for("log"), [basename($drvPath)]);
+    my $log_uri = $c->uri_for($c->controller('Root')->action_for("log"), [WWW::Form::UrlEncoded::PP::url_encode(basename($drvPath))]);
     showLog($c, $mode, $log_uri);
 }
 
@@ -148,7 +151,7 @@ sub view_log : Chained('buildChain') PathPart('log') {
     my ($self, $c, $mode) = @_;
 
     my $drvPath = $c->stash->{build}->drvpath;
-    my $log_uri = $c->uri_for($c->controller('Root')->action_for("log"), [basename($drvPath)]);
+    my $log_uri = $c->uri_for($c->controller('Root')->action_for("log"), [WWW::Form::UrlEncoded::PP::url_encode(basename($drvPath))]);
     showLog($c, $mode, $log_uri);
 }
 
@@ -233,6 +236,9 @@ sub serveFile {
     }
 
     elsif ($ls->{type} eq "regular") {
+        # Have the hosted data considered its own origin to avoid being a giant
+        # XSS hole.
+        $c->response->header('Content-Security-Policy' => 'sandbox allow-scripts');
 
         $c->stash->{'plain'} = { data => grab(cmd => ["nix", "--experimental-features", "nix-command",
                                                       "store", "cat", "--store", getStoreUri(), "$path"]) };

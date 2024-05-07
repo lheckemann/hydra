@@ -7,6 +7,7 @@
 #include <memory>
 #include <queue>
 #include <regex>
+#include <semaphore>
 
 #include <prometheus/counter.h>
 #include <prometheus/gauge.h>
@@ -22,6 +23,7 @@
 #include "sync.hh"
 #include "nar-extractor.hh"
 #include "serve-protocol.hh"
+#include "machines.hh"
 
 
 typedef unsigned int BuildID;
@@ -55,6 +57,7 @@ typedef enum {
     ssConnecting = 10,
     ssSendingInputs = 20,
     ssBuilding = 30,
+    ssWaitingForLocalSlot = 35,
     ssReceivingOutputs = 40,
     ssPostProcessing = 50,
 } StepState;
@@ -234,17 +237,21 @@ void getDependents(Step::ptr step, std::set<Build::ptr> & builds, std::set<Step:
 void visitDependencies(std::function<void(Step::ptr)> visitor, Step::ptr step);
 
 
-struct Machine
+struct Machine : nix::Machine
 {
     typedef std::shared_ptr<Machine> ptr;
 
-    bool enabled{true};
+    /* TODO Get rid of: `nix::Machine::storeUri` is normalized in a way
+       we are not yet used to, but once we are, we don't need this. */
+    std::string sshName;
 
-    std::string sshName, sshKey;
-    std::set<std::string> systemTypes, supportedFeatures, mandatoryFeatures;
-    unsigned int maxJobs = 1;
-    float speedFactor = 1.0;
-    std::string sshPublicHostKey;
+    /* TODO Get rid once `nix::Machine::systemTypes` is a set not
+       vector. */
+    std::set<std::string> systemTypesSet;
+
+    /* TODO Get rid once `nix::Machine::systemTypes` is a `float` not
+       an `int`. */
+    float speedFactorFloat = 1.0;
 
     struct State {
         typedef std::shared_ptr<State> ptr;
@@ -272,7 +279,7 @@ struct Machine
     {
         /* Check that this machine is of the type required by the
            step. */
-        if (!systemTypes.count(step->drv->platform == "builtin" ? nix::settings.thisSystem : step->drv->platform))
+        if (!systemTypesSet.count(step->drv->platform == "builtin" ? nix::settings.thisSystem : step->drv->platform))
             return false;
 
         /* Check that the step requires all mandatory features of this
@@ -382,6 +389,10 @@ private:
     typedef std::map<std::string, Machine::ptr> Machines;
     nix::Sync<Machines> machines; // FIXME: use atomic_shared_ptr
 
+    /* Throttler for CPU-bound local work. */
+    static constexpr unsigned int maxSupportedLocalWorkers = 1024;
+    std::counting_semaphore<maxSupportedLocalWorkers> localWorkThrottler;
+
     /* Various stats. */
     time_t startedAt;
     counter nrBuildsRead{0};
@@ -479,7 +490,12 @@ private:
         prometheus::Counter& queue_steps_created;
         prometheus::Counter& queue_checks_early_exits;
         prometheus::Counter& queue_checks_finished;
-        prometheus::Gauge& queue_max_id;
+
+        prometheus::Counter& dispatcher_time_spent_running;
+        prometheus::Counter& dispatcher_time_spent_waiting;
+
+        prometheus::Counter& queue_monitor_time_spent_running;
+        prometheus::Counter& queue_monitor_time_spent_waiting;
 
         PromMetrics();
     };
@@ -520,23 +536,28 @@ private:
         const std::string & machine);
 
     int createSubstitutionStep(pqxx::work & txn, time_t startTime, time_t stopTime,
-        Build::ptr build, const nix::StorePath & drvPath, const std::string & outputName, const nix::StorePath & storePath);
+        Build::ptr build, const nix::StorePath & drvPath, const nix::Derivation drv, const std::string & outputName, const nix::StorePath & storePath);
 
     void updateBuild(pqxx::work & txn, Build::ptr build, BuildStatus status);
 
     void queueMonitor();
 
-    void queueMonitorLoop();
+    void queueMonitorLoop(Connection & conn);
 
     /* Check the queue for new builds. */
-    bool getQueuedBuilds(Connection & conn,
-        nix::ref<nix::Store> destStore, unsigned int & lastBuildId);
+    bool getQueuedBuilds(Connection & conn, nix::ref<nix::Store> destStore);
 
     /* Handle cancellation, deletion and priority bumps. */
     void processQueueChange(Connection & conn);
 
     BuildOutput getBuildOutputCached(Connection & conn, nix::ref<nix::Store> destStore,
-        const nix::Derivation & drv);
+        const nix::StorePath & drvPath);
+
+    /* Returns paths missing from the remote store. Paths are processed in
+     * parallel to work around the possible latency of remote stores. */
+    std::map<nix::DrvOutput, std::optional<nix::StorePath>> getMissingRemotePaths(
+        nix::ref<nix::Store> destStore,
+        const std::map<nix::DrvOutput, std::optional<nix::StorePath>> & paths);
 
     Step::ptr createStep(nix::ref<nix::Store> store,
         Connection & conn, Build::ptr build, const nix::StorePath & drvPath,
@@ -573,10 +594,11 @@ private:
        retried. */
     enum StepResult { sDone, sRetry, sMaybeCancelled };
     StepResult doBuildStep(nix::ref<nix::Store> destStore,
-        MachineReservation::ptr reservation,
+        MachineReservation::ptr & reservation,
         std::shared_ptr<ActiveStep> activeStep);
 
     void buildRemote(nix::ref<nix::Store> destStore,
+        MachineReservation::ptr & reservation,
         Machine::ptr machine, Step::ptr step,
         const BuildOptions & buildOptions,
         RemoteResult & result, std::shared_ptr<ActiveStep> activeStep,

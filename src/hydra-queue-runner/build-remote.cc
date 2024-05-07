@@ -14,17 +14,11 @@
 #include "util.hh"
 #include "serve-protocol.hh"
 #include "serve-protocol-impl.hh"
+#include "ssh.hh"
 #include "finally.hh"
 #include "url.hh"
 
 using namespace nix;
-
-
-struct Child
-{
-    Pid pid;
-    AutoCloseFD to, from;
-};
 
 
 static void append(Strings & dst, const Strings & src)
@@ -54,7 +48,7 @@ static Strings extraStoreArgs(std::string & machine)
     return result;
 }
 
-static void openConnection(Machine::ptr machine, Path tmpDir, int stderrFD, Child & child)
+static void openConnection(::Machine::ptr machine, Path tmpDir, int stderrFD, SSHMaster::Connection & child)
 {
     std::string pgmName;
     Pipe to, from;
@@ -84,7 +78,7 @@ static void openConnection(Machine::ptr machine, Path tmpDir, int stderrFD, Chil
         append(argv, extraArgs);
     }
 
-    child.pid = startProcess([&]() {
+    child.sshPid = startProcess([&]() {
         restoreProcessContext();
 
         if (dup2(to.readSide.get(), STDIN_FILENO) == -1)
@@ -104,13 +98,18 @@ static void openConnection(Machine::ptr machine, Path tmpDir, int stderrFD, Chil
     to.readSide = -1;
     from.writeSide = -1;
 
-    child.to = to.writeSide.release();
-    child.from = from.readSide.release();
+    child.in = to.writeSide.release();
+    child.out = from.readSide.release();
+
+    // XXX: determine the actual max value we can use from /proc.
+    int pipesize = 1024 * 1024;
+    fcntl(child.in.get(), F_SETPIPE_SZ, &pipesize);
+    fcntl(child.out.get(), F_SETPIPE_SZ, &pipesize);
 }
 
 
 static void copyClosureTo(
-    Machine::Connection & conn,
+    ::Machine::Connection & conn,
     Store & destStore,
     const StorePathSet & paths,
     SubstituteFlag useSubstitutes = NoSubstitute)
@@ -201,7 +200,7 @@ static std::pair<Path, AutoCloseFD> openLogFile(const std::string & logDir, cons
  * Therefore, no `ServeProto::Serialize` functions can be used until
  * that field is set.
  */
-static void handshake(Machine::Connection & conn, unsigned int repeats)
+static void handshake(::Machine::Connection & conn, unsigned int repeats)
 {
     conn.to << SERVE_MAGIC_1 << 0x206;
     conn.to.flush();
@@ -222,23 +221,28 @@ static BasicDerivation sendInputs(
     Step & step,
     Store & localStore,
     Store & destStore,
-    Machine::Connection & conn,
+    ::Machine::Connection & conn,
     unsigned int & overhead,
     counter & nrStepsWaiting,
     counter & nrStepsCopyingTo
 )
 {
-    BasicDerivation basicDrv(*step.drv);
+    /* Replace the input derivations by their output paths to send a
+       minimal closure to the builder.
 
-    for (const auto & [drvPath, node] : step.drv->inputDrvs.map) {
-        auto drv2 = localStore.readDerivation(drvPath);
-        for (auto & name : node.value) {
-            if (auto i = get(drv2.outputs, name)) {
-                auto outPath = i->path(localStore, drv2.name, name);
-                basicDrv.inputSrcs.insert(*outPath);
-            }
-        }
-    }
+       `tryResolve` currently does *not* rewrite input addresses, so it
+       is safe to do this in all cases. (It should probably have a mode
+       to do that, however, but we would not use it here.)
+     */
+    BasicDerivation basicDrv = ({
+        auto maybeBasicDrv = step.drv->tryResolve(destStore, &localStore);
+        if (!maybeBasicDrv)
+            throw Error(
+                "the derivation '%s' can’t be resolved. It’s probably "
+                "missing some outputs",
+                localStore.printStorePath(step.drvPath));
+        *maybeBasicDrv;
+    });
 
     /* Ensure that the inputs exist in the destination store. This is
        a no-op for regular stores, but for the binary cache store,
@@ -278,7 +282,7 @@ static BasicDerivation sendInputs(
 }
 
 static BuildResult performBuild(
-    Machine::Connection & conn,
+    ::Machine::Connection & conn,
     Store & localStore,
     StorePath drvPath,
     const BasicDerivation & drv,
@@ -286,9 +290,6 @@ static BuildResult performBuild(
     counter & nrStepsBuilding
 )
 {
-
-    BuildResult result;
-
     conn.to << ServeProto::Command::BuildDerivation << localStore.printStorePath(drvPath);
     writeDerivation(conn.to, localStore, drv);
     conn.to << options.maxSilentTime << options.buildTimeout;
@@ -301,37 +302,56 @@ static BuildResult performBuild(
     }
     conn.to.flush();
 
-    result.startTime = time(0);
+    BuildResult result;
 
+    time_t startTime, stopTime;
+
+    startTime = time(0);
     {
         MaintainCount<counter> mc(nrStepsBuilding);
-        result.status = (BuildResult::Status)readInt(conn.from);
+        result = ServeProto::Serialise<BuildResult>::read(localStore, conn);
     }
-    result.stopTime = time(0);
+    stopTime = time(0);
 
+    if (!result.startTime) {
+        // If the builder gave `startTime = 0`, use our measurements
+        // instead of the builder's.
+        //
+        // Note: this represents the duration of a single round, rather
+        // than all rounds.
+        result.startTime = startTime;
+        result.stopTime = stopTime;
+    }
 
-    result.errorMsg = readString(conn.from);
-    if (GET_PROTOCOL_MINOR(conn.remoteVersion) >= 3) {
-        result.timesBuilt = readInt(conn.from);
-        result.isNonDeterministic = readInt(conn.from);
-        auto start = readInt(conn.from);
-        auto stop = readInt(conn.from);
-        if (start && start) {
-            /* Note: this represents the duration of a single
-                round, rather than all rounds. */
-            result.startTime = start;
-            result.stopTime = stop;
+    // If the protocol was too old to give us `builtOutputs`, initialize
+    // it manually by introspecting the derivation.
+    if (GET_PROTOCOL_MINOR(conn.remoteVersion) < 6)
+    {
+        // If the remote is too old to handle CA derivations, we can’t get this
+        // far anyways
+        assert(drv.type().hasKnownOutputPaths());
+        DerivationOutputsAndOptPaths drvOutputs = drv.outputsAndOptPaths(localStore);
+        // Since this a `BasicDerivation`, `staticOutputHashes` will not
+        // do any real work.
+        auto outputHashes = staticOutputHashes(localStore, drv);
+        for (auto & [outputName, output] : drvOutputs) {
+            auto outputPath = output.second;
+            // We’ve just asserted that the output paths of the derivation
+            // were known
+            assert(outputPath);
+            auto outputHash = outputHashes.at(outputName);
+            auto drvOutput = DrvOutput { outputHash, outputName };
+            result.builtOutputs.insert_or_assign(
+                std::move(outputName),
+                Realisation { drvOutput, *outputPath });
         }
-    }
-    if (GET_PROTOCOL_MINOR(conn.remoteVersion) >= 6) {
-        ServeProto::Serialise<DrvOutputs>::read(localStore, conn);
     }
 
     return result;
 }
 
 static std::map<StorePath, ValidPathInfo> queryPathInfos(
-    Machine::Connection & conn,
+    ::Machine::Connection & conn,
     Store & localStore,
     StorePathSet & outputs,
     size_t & totalNarSize
@@ -369,7 +389,7 @@ static std::map<StorePath, ValidPathInfo> queryPathInfos(
 }
 
 static void copyPathFromRemote(
-    Machine::Connection & conn,
+    ::Machine::Connection & conn,
     NarMemberDatas & narMembers,
     Store & localStore,
     Store & destStore,
@@ -399,7 +419,7 @@ static void copyPathFromRemote(
 }
 
 static void copyPathsFromRemote(
-    Machine::Connection & conn,
+    ::Machine::Connection & conn,
     NarMemberDatas & narMembers,
     Store & localStore,
     Store & destStore,
@@ -474,9 +494,20 @@ void RemoteResult::updateWithBuildResult(const nix::BuildResult & buildResult)
 
 }
 
+/* Utility guard object to auto-release a semaphore on destruction. */
+template <typename T>
+class SemaphoreReleaser {
+public:
+    SemaphoreReleaser(T* s) : sem(s) {}
+    ~SemaphoreReleaser() { sem->release(); }
+
+private:
+    T* sem;
+};
 
 void State::buildRemote(ref<Store> destStore,
-    Machine::ptr machine, Step::ptr step,
+    MachineReservation::ptr & reservation,
+    ::Machine::ptr machine, Step::ptr step,
     const BuildOptions & buildOptions,
     RemoteResult & result, std::shared_ptr<ActiveStep> activeStep,
     std::function<void(StepState)> updateStep,
@@ -496,13 +527,13 @@ void State::buildRemote(ref<Store> destStore,
         updateStep(ssConnecting);
 
         // FIXME: rewrite to use Store.
-        Child child;
+        SSHMaster::Connection child;
         build_remote::openConnection(machine, tmpDir, logFD.get(), child);
 
         {
             auto activeStepState(activeStep->state_.lock());
             if (activeStepState->cancelled) throw Error("step cancelled");
-            activeStepState->pid = child.pid;
+            activeStepState->pid = child.sshPid;
         }
 
         Finally clearPid([&]() {
@@ -517,9 +548,9 @@ void State::buildRemote(ref<Store> destStore,
                process. Meh. */
         });
 
-        Machine::Connection conn {
-            .from = child.from.get(),
-            .to = child.to.get(),
+        ::Machine::Connection conn {
+            .from = child.out.get(),
+            .to = child.in.get(),
             .machine = machine,
         };
 
@@ -531,7 +562,7 @@ void State::buildRemote(ref<Store> destStore,
         try {
           build_remote::handshake(conn, buildOptions.repeats);
         } catch (EndOfFile & e) {
-            child.pid.wait();
+            child.sshPid.wait();
             std::string s = chomp(readFile(result.logFile));
             throw Error("cannot connect to ‘%1%’: %2%", machine->sshName, s);
         }
@@ -592,6 +623,27 @@ void State::buildRemote(ref<Store> destStore,
             result.logFile = "";
         }
 
+        /* Throttle CPU-bound work. Opportunistically skip updating the current
+         * step, since this requires a DB roundtrip. */
+        if (!localWorkThrottler.try_acquire()) {
+            updateStep(ssWaitingForLocalSlot);
+            localWorkThrottler.acquire();
+        }
+        SemaphoreReleaser releaser(&localWorkThrottler);
+
+        /* Once we've started copying outputs, release the machine reservation
+         * so further builds can happen. We do not release the machine earlier
+         * to avoid situations where the queue runner is bottlenecked on
+         * copying outputs and we end up building too many things that we
+         * haven't been able to allow copy slots for. */
+        assert(reservation.unique());
+        reservation = 0;
+        wakeDispatcher();
+
+        StorePathSet outputs;
+        for (auto & [_, realisation] : buildResult.builtOutputs)
+            outputs.insert(realisation.outPath);
+
         /* Copy the output paths. */
         if (!machine->isLocalhost() || localStore != std::shared_ptr<Store>(destStore)) {
             updateStep(ssReceivingOutputs);
@@ -599,12 +651,6 @@ void State::buildRemote(ref<Store> destStore,
             MaintainCount<counter> mc(nrStepsCopyingFrom);
 
             auto now1 = std::chrono::steady_clock::now();
-
-            StorePathSet outputs;
-            for (auto & i : step->drv->outputsAndOptPaths(*localStore)) {
-                if (i.second.second)
-                   outputs.insert(*i.second.second);
-            }
 
             size_t totalNarSize = 0;
             auto infos = build_remote::queryPathInfos(conn, *localStore, outputs, totalNarSize);
@@ -624,9 +670,24 @@ void State::buildRemote(ref<Store> destStore,
             result.overhead += std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now1).count();
         }
 
+        /* Register the outputs of the newly built drv */
+        if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
+            auto outputHashes = staticOutputHashes(*localStore, *step->drv);
+            for (auto & [outputName, realisation] : buildResult.builtOutputs) {
+                // Register the resolved drv output
+                destStore->registerDrvOutput(realisation);
+
+                // Also register the unresolved one
+                auto unresolvedRealisation = realisation;
+                unresolvedRealisation.signatures.clear();
+                unresolvedRealisation.id.drvHash = outputHashes.at(outputName);
+                destStore->registerDrvOutput(unresolvedRealisation);
+            }
+        }
+
         /* Shut down the connection. */
-        child.to = -1;
-        child.pid.wait();
+        child.in = -1;
+        child.sshPid.wait();
 
     } catch (Error & e) {
         /* Disable this machine until a certain period of time has

@@ -16,8 +16,11 @@ use List::Util qw[min max];
 use List::SomeUtils qw{any};
 use Net::Prometheus;
 use Types::Standard qw/StrMatch/;
+use WWW::Form::UrlEncoded::PP qw();
 
 use constant NARINFO_REGEX => qr{^([a-z0-9]{32})\.narinfo$};
+# e.g.: https://hydra.example.com/realisations/sha256:a62128132508a3a32eef651d6467695944763602f226ac630543e947d9feb140!out.doi
+use constant REALISATIONS_REGEX => qr{^(sha256:[a-z0-9]{64}![a-z]+)\.doi$};
 
 # Put this controller at top-level.
 __PACKAGE__->config->{namespace} = '';
@@ -157,7 +160,7 @@ sub status_GET {
             { "buildsteps.busy" => { '!=', 0 } },
             { order_by => ["globalpriority DESC", "id"],
               join => "buildsteps",
-              columns => [@buildListColumns]
+              columns => [@buildListColumns, 'buildsteps.drvpath', 'buildsteps.type']
             })]
     );
 }
@@ -355,6 +358,33 @@ sub nix_cache_info :Path('nix-cache-info') :Args(0) {
 }
 
 
+sub realisations :Path('realisations') :Args(StrMatch[REALISATIONS_REGEX]) {
+    my ($self, $c, $realisation) = @_;
+
+    if (!isLocalStore) {
+        notFound($c, "There is no binary cache here.");
+    }
+
+    else {
+        my ($rawDrvOutput) = $realisation =~ REALISATIONS_REGEX;
+        my $rawRealisation = queryRawRealisation($rawDrvOutput);
+
+        if (!$rawRealisation) {
+            $c->response->status(404);
+            $c->response->content_type('text/plain');
+            $c->stash->{plain}->{data} = "does not exist\n";
+            $c->forward('Hydra::View::Plain');
+            setCacheHeaders($c, 60 * 60);
+            return;
+        }
+
+        $c->response->content_type('text/plain');
+        $c->stash->{plain}->{data} = $rawRealisation;
+        $c->forward('Hydra::View::Plain');
+    }
+}
+
+
 sub narinfo :Path :Args(StrMatch[NARINFO_REGEX]) {
     my ($self, $c, $narinfo) = @_;
 
@@ -524,7 +554,7 @@ sub log :Local :Args(1) {
     my $logPrefix = $c->config->{log_prefix};
 
     if (defined $logPrefix) {
-        $c->res->redirect($logPrefix . "log/" . basename($drvPath));
+        $c->res->redirect($logPrefix . "log/" . WWW::Form::UrlEncoded::PP::url_encode(basename($drvPath)));
     } else {
         notFound($c, "The build log of $drvPath is not available.");
     }

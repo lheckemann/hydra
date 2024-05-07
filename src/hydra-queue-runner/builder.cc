@@ -46,10 +46,12 @@ void State::builder(MachineReservation::ptr reservation)
         }
     }
 
-    /* Release the machine and wake up the dispatcher. */
-    assert(reservation.unique());
-    reservation = 0;
-    wakeDispatcher();
+    /* If the machine hasn't been released yet, release and wake up the dispatcher. */
+    if (reservation) {
+        assert(reservation.unique());
+        reservation = 0;
+        wakeDispatcher();
+    }
 
     /* If there was a temporary failure, retry the step after an
        exponentially increasing interval. */
@@ -72,11 +74,11 @@ void State::builder(MachineReservation::ptr reservation)
 
 
 State::StepResult State::doBuildStep(nix::ref<Store> destStore,
-    MachineReservation::ptr reservation,
+    MachineReservation::ptr & reservation,
     std::shared_ptr<ActiveStep> activeStep)
 {
-    auto & step(reservation->step);
-    auto & machine(reservation->machine);
+    auto step(reservation->step);
+    auto machine(reservation->machine);
 
     {
         auto step_(step->state.lock());
@@ -208,7 +210,7 @@ State::StepResult State::doBuildStep(nix::ref<Store> destStore,
 
         try {
             /* FIXME: referring builds may have conflicting timeouts. */
-            buildRemote(destStore, machine, step, buildOptions, result, activeStep, updateStep, narMembers);
+            buildRemote(destStore, reservation, machine, step, buildOptions, result, activeStep, updateStep, narMembers);
         } catch (Error & e) {
             if (activeStep->state_.lock()->cancelled) {
                 printInfo("marking step %d of build %d as cancelled", stepNr, buildId);
@@ -223,7 +225,7 @@ State::StepResult State::doBuildStep(nix::ref<Store> destStore,
 
         if (result.stepStatus == bsSuccess) {
             updateStep(ssPostProcessing);
-            res = getBuildOutput(destStore, narMembers, *step->drv);
+            res = getBuildOutput(destStore, narMembers, destStore->queryDerivationOutputMap(step->drvPath, &*localStore));
         }
     }
 
@@ -277,9 +279,12 @@ State::StepResult State::doBuildStep(nix::ref<Store> destStore,
 
         assert(stepNr);
 
-        for (auto & i : step->drv->outputsAndOptPaths(*localStore)) {
-            if (i.second.second)
-               addRoot(*i.second.second);
+        for (auto & [outputName, optOutputPath] : destStore->queryPartialDerivationOutputMap(step->drvPath, &*localStore)) {
+            if (!optOutputPath)
+                throw Error(
+                    "Missing output %s for derivation %d which was supposed to have succeeded",
+                    outputName, localStore->printStorePath(step->drvPath));
+            addRoot(*optOutputPath);
         }
 
         /* Register success in the database for all Build objects that
@@ -400,7 +405,7 @@ void State::failStep(
     Step::ptr step,
     BuildID buildId,
     const RemoteResult & result,
-    Machine::ptr machine,
+    ::Machine::ptr machine,
     bool & stepFinished)
 {
     /* Register failure in the database for all Build objects that
